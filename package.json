@@ -1,0 +1,28 @@
+{
+  "name": "speck",
+  "version": "0.1.0",
+  "description": "Identify a file from its bytes, not its extension, and report what is hidden: appended data, embedded scripts, mismatched names, high entropy.",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "speck": "bin/speck.js"
+  },
+  "main": "src/index.js",
+  "exports": {
+    ".": "./src/index.js"
+  },
+  "files": ["bin", "src", "README.md", "LICENSE", "CHANGELOG.md"],
+  "engines": {
+    "node": ">=18.17"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/d20260825613-hub/speck.git"
+  },
+  "scripts": {
+    "start": "node bin/speck.js",
+    "test": "node --test test/speck.test.js test/cli.test.js"
+  },
+  "os": ["win32", "darwin", "linux"],
+  "keywords": ["file-format", "magic-bytes", "file-identification", "forensics", "strings", "entropy", "cli", "nodejs", "zero-dependencies"]
+}
