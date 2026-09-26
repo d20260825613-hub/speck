@@ -157,11 +157,9 @@ export async function analyzeFile(file, options = {}) {
     }
   }
   if (format?.id === 'png') {
-    const iend = tail.lastIndexOf(Buffer.from([0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82]));
-    if (iend >= 0) {
-      const declaredEnd = stat.size - tail.length + iend + 8;
-      const trailing = stat.size - declaredEnd;
-      if (trailing > 0) warnings.push(`${trailing} bytes follow the IEND chunk of the PNG`);
+    const end = pngEndOffset(head, tail, stat.size);
+    if (end !== null && stat.size > end) {
+      warnings.push(`${stat.size - end} bytes follow the IEND chunk of the PNG`);
     }
   }
 
@@ -218,6 +216,39 @@ export async function analyzeFile(file, options = {}) {
     warnings,
     notes,
   };
+}
+
+/**
+ * Where a PNG's data ends, according to the chunk list.
+ *
+ * Chunks are walked in order rather than searched for, because searching for
+ * IEND needs its CRC to be correct — and plenty of writers, including test
+ * fixtures, emit a wrong or zero CRC. Walking also rejects a stray "IEND" that
+ * happens to appear inside compressed image data.
+ *
+ * Returns the byte offset just past the IEND chunk, or null when the walk could
+ * not reach it within the bytes available.
+ */
+function pngEndOffset(head, tail, totalSize) {
+  const buffer = Buffer.concat([head, tail]);
+  // The head starts at 0; the tail starts at totalSize - tail.length.
+  const tailStart = totalSize - tail.length;
+  let offset = 8; // past the signature
+  while (offset + 12 <= buffer.length) {
+    const absolute = offset;
+    const length = buffer.readUInt32BE(offset);
+    const type = buffer.toString('latin1', offset + 4, offset + 8);
+    if (!/^[A-Za-z]{4}$/.test(type)) return null; // not a chunk header; give up
+    const chunkEnd = offset + 12 + length;
+    if (type === 'IEND') {
+      // Only meaningful when the offset is inside the head, or the tail covers it.
+      const absoluteEnd = (absolute < head.length ? absolute : tailStart + (absolute - head.length)) + 12 + length;
+      return absoluteEnd;
+    }
+    if (chunkEnd > buffer.length) return null;
+    offset = chunkEnd;
+  }
+  return null;
 }
 
 /** Analyse several files, keeping going when one of them fails. */
