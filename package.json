@@ -21,7 +21,7 @@
   },
   "scripts": {
     "start": "node bin/speck.js",
-    "test": "node --test test/speck.test.js test/cli.test.js"
+    "test": "node --test test/speck.test.js test/cli.test.js test/cli-kit.test.js"
   },
   "os": ["win32", "darwin", "linux"],
   "keywords": ["file-format", "magic-bytes", "file-identification", "forensics", "strings", "entropy", "cli", "nodejs", "zero-dependencies"]

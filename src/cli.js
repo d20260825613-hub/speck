@@ -14,8 +14,9 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import process from 'node:process';
 
-import { analyzeFile, analyzeMany, entropy } from './analyze.js';
-import { FORMATS, looksLikeText } from './magic.js';
+import { UsageError, formatError, installCliHandlers, unknownOptionError } from './cli-kit.js';
+import { analyzeFile, analyzeMany } from './analyze.js';
+import { FORMATS } from './magic.js';
 
 const VERSION = '0.1.0';
 
@@ -32,6 +33,7 @@ Options
       --strings          in info, also list printable strings
   -n, --min <n>          minimum string length (default 6)
       --json             machine-readable output
+      --debug            print stack traces for unexpected errors
   -h, --help             this text
   -v, --version          version
 
@@ -46,7 +48,8 @@ What it looks for
 Exit codes
   0  everything identified
   1  a file could not be read
-  2  a file was identified but its name disagrees with its contents
+  2  a usage problem: an unknown option, a missing value, a missing argument
+  3  a file was identified but its name disagrees with its contents
 
 Examples
   speck identify download.zip
@@ -55,26 +58,131 @@ Examples
   speck identify *.bin --json
 `;
 
-function fail(message, code = 1) {
-  process.stderr.write(`speck: ${message}\n`);
-  return code;
+/**
+ * Every long option the parser below handles, for the "did you mean" hint.
+ *
+ * Kept beside the switch it describes, because a list maintained anywhere else
+ * is a list that is wrong within a month. `--help` and `--version` are handled
+ * by `run` before parsing starts, so they are not in here.
+ */
+export const OPTION_NAMES = ['hash', 'strings', 'min', 'json', 'debug'];
+
+/** A concrete example for each option that takes a value, used in error hints. */
+const VALUE_EXAMPLES = {
+  '--min': '--min 8',
+};
+
+/**
+ * `--debug` (or SPECK_DEBUG=1) turns stack traces on.
+ *
+ * Read at throw time rather than cached, and taken from the argv `run` was given
+ * as well as from `process.argv`, so an in-process caller that passes `--debug`
+ * gets the same output as the shell. Assigned on every run, never merged, so one
+ * in-process run cannot leave debug on for the next.
+ */
+let debugRequested = false;
+function isDebug() {
+  return debugRequested || process.argv.includes('--debug') || process.env.SPECK_DEBUG === '1';
+}
+
+/**
+ * Print whatever a command or the parser raised.
+ *
+ * 2 means "you asked for something impossible" and 1 means "the operation
+ * failed". Keeping the two apart is the only way a script can tell a typo from
+ * an unreadable file, and mixing them is how a caller ends up retrying
+ * something that can never work.
+ *
+ * Messages are collapsed to one line: an fs error carries a whole path and an
+ * errno sentence, and a raw stack trace is never printed unless --debug is on.
+ */
+function failFrom(error) {
+  const message = error && typeof error === 'object' && 'message' in error ? error.message : String(error);
+  const oneLine = typeof message === 'string' ? message.replace(/\s+/g, ' ').trim() : String(message);
+  const printable = error instanceof UsageError ? error : oneLine;
+  process.stderr.write(formatError(printable, { tool: 'speck', usage: () => USAGE, debug: isDebug() }));
+  return error instanceof UsageError ? (error.code ?? 2) : 1;
+}
+
+/** The error for an option whose value never arrived. */
+function missingValueError(name) {
+  const example = VALUE_EXAMPLES[name] ?? `${name} <value>`;
+  return new UsageError(`${name} needs a value`, { hint: `for example ${example}` });
+}
+
+/**
+ * An unknown option, with the closest real one attached.
+ *
+ * `unknownOptionError` strips the leading dashes itself, so the token goes in
+ * exactly as the user typed it. There is one short option (`-n`), and a bare
+ * `-m` has nothing long enough to compare against, so the fallback names the
+ * only short option there is instead of leaving the user to guess.
+ */
+function failUnknownOption(token) {
+  if (token.startsWith('--')) return unknownOptionError(token, OPTION_NAMES);
+  const bare = String(token).replace(/^-+/, '');
+  if (bare.length === 1) {
+    return new UsageError(`unknown option: ${token}`, { hint: 'the only short option is -n (--min)' });
+  }
+  return unknownOptionError(token, OPTION_NAMES);
 }
 
 function parseArgs(argv) {
-  const values = { hash: false, strings: false, json: false, min: 6 };
+  const values = { hash: false, strings: false, json: false, min: 6, debug: false };
   const files = [];
   for (let i = 0; i < argv.length; i += 1) {
     const token = argv[i];
-    if (token === '--hash') values.hash = true;
-    else if (token === '--strings') values.strings = true;
-    else if (token === '--json') values.json = true;
-    else if (token === '-n' || token === '--min') values.min = Number(argv[++i]);
-    else if (token.startsWith('--min=')) values.min = Number(token.slice(6));
-    else if (token === '--') files.push(...argv.slice(i + 1));
-    else if (token.startsWith('-') && token !== '-') return { error: `unknown option: ${token}` };
-    else files.push(token);
+    const eq = token.indexOf('=');
+    const inline = eq > 1 && token.startsWith('--') ? token.slice(eq + 1) : null;
+    // A value-taking option is short of a value when nothing follows it, and
+    // also when the inline form is empty (`--min=`). Both are caught here, at
+    // the option that is at fault, instead of becoming `NaN` and failing later
+    // with a message about something else.
+    let missing = null;
+    const take = (name) => {
+      if (inline !== null) {
+        if (inline !== '') return inline;
+        missing ??= name;
+        return undefined;
+      }
+      const next = argv[++i];
+      if (next !== undefined) return next;
+      missing ??= name;
+      return undefined;
+    };
+
+    switch (token.split('=')[0]) {
+      case '--hash':
+        values.hash = true;
+        break;
+      case '--strings':
+        values.strings = true;
+        break;
+      case '--json':
+        values.json = true;
+        break;
+      case '--debug':
+        values.debug = true;
+        break;
+      case '-n':
+      case '--min':
+        values.min = Number(take('--min'));
+        break;
+      default:
+        if (token === '--') {
+          files.push(...argv.slice(i + 1));
+          return { values, files };
+        }
+        if (token.startsWith('-') && token !== '-') return { error: failUnknownOption(token) };
+        files.push(token);
+    }
+    if (missing) return { error: missingValueError(missing) };
   }
-  if (!Number.isInteger(values.min) || values.min < 2) return { error: '--min must be an integer of at least 2' };
+  if (!Number.isInteger(values.min) || values.min < 2) {
+    return {
+      error: new UsageError('--min must be an integer of at least 2', { hint: 'for example --min 8' }),
+    };
+  }
   return { values, files };
 }
 
@@ -108,9 +216,11 @@ function kindColour(kind) {
 
 async function commandIdentify(argv) {
   const parsed = parseArgs(argv);
-  if (parsed.error) return fail(parsed.error);
+  if (parsed.error) return failFrom(parsed.error);
   const { values, files } = parsed;
-  if (files.length === 0) return fail('identify needs at least one file');
+  if (files.length === 0) {
+    throw new UsageError('identify needs at least one file', { hint: 'for example speck identify photo.png' });
+  }
 
   const results = await analyzeMany(files, { hash: values.hash });
   if (values.json) {
@@ -132,15 +242,21 @@ async function commandIdentify(argv) {
   // warnings, and reaching for them on the latter crashed the whole command.
   const unreadable = results.some((r) => Boolean(r.error));
   const mismatched = results.some((r) => Array.isArray(r.warnings) && r.warnings.some((w) => w.includes('does not match')));
+  // An unreadable file is reported first: it is the failure the caller has to
+  // deal with, and it leaves the question of the other files unanswered.
   if (unreadable) return 1;
-  return mismatched ? 2 : 0;
+  // 3, not 2: a name that disagrees with the contents is a finding, not a usage
+  // error, and a caller has to be able to tell the two apart.
+  return mismatched ? 3 : 0;
 }
 
 async function commandInfo(argv) {
   const parsed = parseArgs(argv);
-  if (parsed.error) return fail(parsed.error);
+  if (parsed.error) return failFrom(parsed.error);
   const { values, files } = parsed;
-  if (files.length === 0) return fail('info needs at least one file');
+  if (files.length === 0) {
+    throw new UsageError('info needs at least one file', { hint: 'for example speck info photo.png' });
+  }
 
   const results = [];
   for (const file of files) {
@@ -152,6 +268,8 @@ async function commandInfo(argv) {
         }),
       );
     } catch (error) {
+      // A missing file, a permission error or a directory is one line on
+      // stdout next to the files that did work, and exit 1 at the end.
       results.push({ path: path.resolve(file), name: path.basename(file), error: error.message });
     }
   }
@@ -206,16 +324,18 @@ async function commandInfo(argv) {
 
 async function commandStrings(argv) {
   const parsed = parseArgs(argv);
-  if (parsed.error) return fail(parsed.error);
+  if (parsed.error) return failFrom(parsed.error);
   const { values, files } = parsed;
   const file = files[0];
-  if (!file) return fail('strings needs a file');
+  if (!file) throw new UsageError('strings needs a file', { hint: 'for example speck strings suspicious.pdf' });
 
   let result;
   try {
     result = await analyzeFile(file, { strings: values.min });
   } catch (error) {
-    return fail(error.message);
+    // A missing file or a directory is a failed operation (1), not a usage
+    // error: the command was typed correctly, the world was not as expected.
+    return failFrom(error);
   }
 
   if (values.json) {
@@ -249,6 +369,19 @@ function commandFormats() {
  * @returns {Promise<number>} exit code
  */
 export async function run(argv) {
+  // Taken from this invocation rather than only from process.argv, so an
+  // in-process caller that passes --debug gets stack traces too.
+  debugRequested = argv.includes('--debug');
+  try {
+    return await dispatch(argv);
+  } catch (error) {
+    // The one place that decides how a problem is reported: a UsageError keeps
+    // its own code (2), and anything unexpected is a failed operation (1).
+    return failFrom(error);
+  }
+}
+
+async function dispatch(argv) {
   if (argv.length === 0 || argv[0] === '-h' || argv[0] === '--help' || argv[0] === 'help') {
     process.stdout.write(USAGE);
     return 0;
@@ -269,18 +402,42 @@ export async function run(argv) {
     case 'formats':
       return commandFormats();
     default:
-      return fail(`unknown command: ${command}. Try "speck --help"`);
+      // A mistyped command is a usage error, so the hint names the real ones
+      // instead of leaving the user to guess what "identfy" might have been.
+      throw new UsageError(`unknown command: ${command}`, {
+        hint: 'the commands are identify, info, strings and formats',
+      });
   }
 }
 
+/**
+ * Install the process-wide safety net: broken pipes, Ctrl-C, and the two
+ * leftover error events.
+ *
+ * Exported so `bin/speck.js` installs exactly the same set. It matters because
+ * the bin entry is what ends up on PATH: handlers installed only for
+ * `node src/cli.js` would cover the one invocation nobody uses. The kit keeps a
+ * WeakMap of what has been installed, so the bin entry and this module both
+ * asking is a no-op rather than a doubled message.
+ */
+export function installHandlers() {
+  return installCliHandlers({
+    tool: 'speck',
+    usage: () => USAGE,
+    debug: isDebug,
+  });
+}
+
+// Only run when invoked directly, so importing this module in a test is safe.
 if (process.argv[1] && import.meta.url === new URL(`file://${process.argv[1].replace(/\\/g, '/')}`).href) {
+  // Installed before anything else runs, for `node src/cli.js ...`.
+  installHandlers();
   run(process.argv.slice(2)).then(
     (code) => {
       process.exitCode = code;
     },
     (error) => {
-      process.stderr.write(`speck: ${error?.stack ?? error}\n`);
-      process.exitCode = 1;
+      process.exitCode = failFrom(error);
     },
   );
 }

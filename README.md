@@ -61,18 +61,24 @@ Node 18.17 or newer. No dependencies.
 | `speck strings <file>` | Printable ASCII runs, `--min` to set the length. |
 | `speck formats` | The 40 formats this build recognises. |
 
-`--json` on any of them gives a machine-readable report.
+`--json` on any of them gives a machine-readable report. `--debug` prints a stack
+trace when something unexpected goes wrong; without it every failure is one line
+and an optional hint.
 
 ### Exit codes
 
 | Code | Meaning |
 | --- | --- |
 | 0 | everything identified, no disagreement |
-| 1 | a file could not be read |
-| 2 | a file was identified and its extension disagrees with its contents |
+| 1 | a file could not be read: missing, unreadable, or a directory |
+| 2 | a usage problem: an unknown option, a missing value, a missing or unknown argument |
+| 3 | a file was identified and its extension disagrees with its contents |
 
-That `2` is deliberate: it makes `speck identify *` usable in a script that
-wants to know whether anything in a directory is misnamed.
+Code `2` is never a finding about a file, and code `3` is never a complaint about
+how the command was typed. That split is deliberate: `speck identify *` can be
+run in a script that cares only about misnamed files and can treat `2` as its own
+bug, while a `1` means the answer is incomplete. An earlier version reported a
+misnamed file as `2`, so a script that read it that way has to be updated.
 
 ## What it reports
 
@@ -126,10 +132,16 @@ you were hoping for an exact format.
 npm test
 ```
 
-27 tests. The fixtures build real PNG, ZIP and gzip containers byte by byte
-rather than shipping binary files, so the tests show exactly which bytes are
-being relied on. The cases that matter are the disagreements: a PNG named `.jpg`,
-a payload appended after `IEND`, a truncated header, a file with no header at all.
+50 tests across three files: 27 for identification and analysis (`test/speck.test.js`),
+13 that drive the CLI in-process (`test/cli.test.js`) and 10 for the shared error
+and exit-code behaviour (`test/cli-kit.test.js`). The test script names every file
+rather than passing `test/`, because Node 24 rejects a bare directory and Node 18
+and 20 reject a glob, and a file that is named but missing is skipped in silence.
+
+The fixtures build real PNG, ZIP and gzip containers byte by byte rather than
+shipping binary files, so the tests show exactly which bytes are being relied on.
+The cases that matter are the disagreements: a PNG named `.jpg`, a payload
+appended after `IEND`, a truncated header, a file with no header at all.
 
 ## License
 

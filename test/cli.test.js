@@ -2,9 +2,10 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import process from 'node:process';
 import test, { after } from 'node:test';
 
-import { run } from '../src/cli.js';
+import { OPTION_NAMES, installHandlers, run } from '../src/cli.js';
 
 const cleanups = [];
 after(async () => {
@@ -52,6 +53,30 @@ async function runCli(argv) {
   }
 }
 
+/**
+ * Listener counts taken at import time, before any test has installed anything.
+ * Used by the first test below; nothing here may call installHandlers first.
+ * The runner itself owns some of these (it has an uncaughtException handler of
+ * its own), so this records what was there rather than asserting zero.
+ */
+const AT_IMPORT = {
+  sigint: process.listenerCount('SIGINT'),
+  sigterm: process.listenerCount('SIGTERM'),
+  uncaught: process.listenerCount('uncaughtException'),
+  unhandled: process.listenerCount('unhandledRejection'),
+};
+
+test('importing src/cli.js installs no handlers', () => {
+  // Handlers are a side effect of running the tool, not of importing it, so a
+  // test or an embedded caller does not inherit SIGINT and uncaughtException
+  // behaviour it never asked for. This test must run first: everything below
+  // installs and removes handlers of its own.
+  assert.equal(process.listenerCount('SIGINT'), AT_IMPORT.sigint);
+  assert.equal(process.listenerCount('SIGTERM'), AT_IMPORT.sigterm);
+  assert.equal(process.listenerCount('uncaughtException'), AT_IMPORT.uncaught);
+  assert.equal(process.listenerCount('unhandledRejection'), AT_IMPORT.unhandled);
+});
+
 test('--help and --version are self-contained', async () => {
   const help = await runCli(['--help']);
   assert.equal(help.code, 0);
@@ -71,10 +96,12 @@ test('identify prints one line per file and exits 0 for matching names', async (
   assert.match(result.stdout, /PNG image/);
 });
 
-test('identify exits 2 when the extension disagrees with the contents', async () => {
+test('identify exits 3 when the extension disagrees with the contents', async () => {
+  // 3, not 2: a misnamed file is a finding. 2 is reserved for usage problems, so
+  // a script can tell "your argument was wrong" from "this file is misnamed".
   const file = await makeFile('photo.jpg', pngBuffer());
   const result = await runCli(['identify', file]);
-  assert.equal(result.code, 2, '2 is the "identified but misnamed" code');
+  assert.equal(result.code, 3, '3 is the "identified but misnamed" code');
   assert.match(result.stdout, /does not match/);
 });
 
@@ -139,12 +166,126 @@ test('formats lists what this build knows', async () => {
   assert.match(result.stdout, /ELF executable/);
 });
 
-test('bad usage is refused with a clear message', async () => {
-  assert.equal((await runCli(['frobnicate'])).code, 1);
-  assert.match((await runCli(['identify'])).stderr, /needs at least one file/);
-  assert.match((await runCli(['strings'])).stderr, /needs a file/);
-  assert.match((await runCli(['identify', '--nonsense', 'x'])).stderr, /unknown option/);
-  assert.match((await runCli(['strings', 'x', '-n', '1'])).stderr, /at least 2/);
+test('bad usage is refused with exit code 2', async () => {
+  // 2 is "you asked for something impossible": an unknown command, a missing
+  // argument, a bad value. A missing file or a directory is 1 instead, so this
+  // is the code that has to stay reserved for arguments alone.
+  assert.equal((await runCli(['frobnicate'])).code, 2);
+  assert.equal((await runCli(['identify'])).code, 2);
+  assert.equal((await runCli(['info'])).code, 2);
+  assert.equal((await runCli(['strings'])).code, 2);
+  assert.equal((await runCli(['identify', '--nonsense', 'x'])).code, 2);
+  assert.equal((await runCli(['strings', 'x', '-n', '1'])).code, 2);
+  assert.equal((await runCli(['strings', 'x', '--min=abc'])).code, 2);
+});
+
+test('each usage problem names what was wrong', async () => {
+  assert.match((await runCli(['frobnicate'])).stderr, /unknown command: frobnicate/);
+  assert.match((await runCli(['identify'])).stderr, /identify needs at least one file/);
+  assert.match((await runCli(['info'])).stderr, /info needs at least one file/);
+  assert.match((await runCli(['strings'])).stderr, /strings needs a file/);
+  assert.match((await runCli(['identify', '--nonsense', 'x'])).stderr, /unknown option --nonsense/);
+  assert.match((await runCli(['strings', 'x', '-n', '1'])).stderr, /--min must be an integer of at least 2/);
+});
+
+test('a mistyped option suggests the real one', async () => {
+  const result = await runCli(['identify', '--hsah', 'x']);
+  assert.equal(result.code, 2);
+  assert.match(result.stderr, /unknown option --hsah/);
+  assert.match(result.stderr, /did you mean --hash\?/);
+});
+
+test('every name in OPTION_NAMES is one the parser actually handles', async () => {
+  // A list that drifts from the parser either suggests an option that does not
+  // exist, or stops suggesting one that does.
+  const values = { min: '8' };
+  for (const name of OPTION_NAMES) {
+    const argv = [`identify`, '--debug', `--${name}`, ...(values[name] ? [values[name]] : []), 'missing-file-xyz'];
+    const result = await runCli(argv);
+    assert.doesNotMatch(result.stderr, /unknown option/, `--${name} is in OPTION_NAMES but not handled`);
+  }
+});
+
+test('an option whose value never arrived is a usage error', async () => {
+  const result = await runCli(['identify', '--min']);
+  assert.equal(result.code, 2);
+  assert.match(result.stderr, /--min needs a value/);
+  assert.match(result.stderr, /for example --min 8/);
+});
+
+test('an unknown short option says which short option exists', async () => {
+  // `-n` is too short for a "did you mean" comparison, so the hint names it.
+  const result = await runCli(['strings', 'x', '-m', '8']);
+  assert.equal(result.code, 2);
+  assert.match(result.stderr, /unknown option: -m/);
+  assert.match(result.stderr, /the only short option is -n/);
+});
+
+test('a missing file is a failed operation, not a usage error', async () => {
+  const missing = path.join(os.tmpdir(), 'speck-definitely-not-here.bin');
+  const identify = await runCli(['identify', missing]);
+  assert.equal(identify.code, 1, identify.stderr);
+
+  const info = await runCli(['info', missing]);
+  assert.equal(info.code, 1, info.stderr);
+
+  const strings = await runCli(['strings', missing]);
+  assert.equal(strings.code, 1, strings.stderr);
+  assert.match(strings.stderr, /speck: /);
+});
+
+test('a directory is a failed operation, not a crash', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'speck-cli-dir-'));
+  cleanups.push(dir);
+  const result = await runCli(['strings', dir]);
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /is a directory/);
+});
+
+test('the identify code 3 wins over nothing, and an unreadable file still wins over it', async () => {
+  const mismatched = await makeFile('photo.jpg', pngBuffer());
+  assert.equal((await runCli(['identify', mismatched])).code, 3);
+
+  const missing = path.join(path.dirname(mismatched), 'nope.bin');
+  const both = await runCli(['identify', mismatched, missing]);
+  assert.equal(both.code, 1, 'a file that could not be read is reported before a misnamed one');
+});
+
+test('no stack frames are printed unless --debug is on', async () => {
+  const frame = /at .*\(.*:\d+:\d+\)/;
+
+  // A usage error, a failed operation and a non-existent file: none of them is
+  // a crash, so none of them is allowed to print a stack trace.
+  const quiet = [
+    await runCli(['identify']),
+    await runCli(['frobnicate']),
+    await runCli(['identify', '--hsah', 'x']),
+    await runCli(['strings', path.join(os.tmpdir(), 'speck-definitely-not-here.bin')]),
+  ];
+  for (const result of quiet) {
+    assert.equal(frame.test(result.stderr), false, `a stack frame escaped: ${result.stderr}`);
+    assert.match(result.stderr, /^speck: /, `every message is prefixed with the tool: ${result.stderr}`);
+  }
+
+  const debug = await runCli(['frobnicate', '--debug']);
+  assert.equal(debug.code, 2, 'so that a stack trace is printed at all');
+  assert.match(debug.stderr, frame, '--debug is the one path that shows a stack');
+});
+
+test('installHandlers is installed once by the bin entry and once by the module', async () => {
+  // The bin entry is what ends up on PATH, so it installs its own handlers; the
+  // direct-run block in src/cli.js installs them too, for `node src/cli.js`. The
+  // kit makes the second call a no-op, which this checks, and the first test in
+  // this file checked that importing src/cli.js installs nothing on its own.
+  const baseline = process.listenerCount('SIGINT');
+  const remove = installHandlers();
+  const afterFirst = process.listenerCount('SIGINT');
+  assert.equal(afterFirst, baseline + 1);
+
+  installHandlers();
+  assert.equal(process.listenerCount('SIGINT'), afterFirst, 'a second install added listeners');
+  remove();
+  assert.equal(process.listenerCount('SIGINT'), baseline);
 });
 
 test('an executable wearing an image extension is caught', async () => {
@@ -158,7 +299,7 @@ test('an executable wearing an image extension is caught', async () => {
   const file = await makeFile('holiday.png', buffer);
 
   const result = await runCli(['identify', file]);
-  assert.equal(result.code, 2);
+  assert.equal(result.code, 3);
   assert.match(result.stdout, /PE executable/);
   assert.match(result.stdout, /does not match/);
 });
