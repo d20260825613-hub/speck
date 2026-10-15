@@ -13,6 +13,7 @@ import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
 import test from 'node:test';
+import { fileURLToPath } from 'node:url';
 
 import { UsageError, formatError, installCliHandlers, nearestName, unknownOptionError } from '../src/cli-kit.js';
 
@@ -136,4 +137,26 @@ test('the bin entry installs the handlers, which the module alone cannot do', as
   } finally {
     await fs.rm(dir, { recursive: true, force: true });
   }
+});
+
+test('every test declared in test/cli.test.js reaches the runner report', async () => {
+  // A test that replaces `process.stdout.write` — the obvious way to capture a
+  // CLI's output in-process — swallows the test runner's own result writes too,
+  // because the runner reports over that stream when it runs a file in a child
+  // process. Ten tests in test/cli.test.js disappeared from `npm test` that way
+  // while it reported a clean pass: green, and a fifth of the suite not running.
+  //
+  // The check lives here rather than in that file because a file cannot report
+  // its own disappearance. This one never touches process.stdout, so its own
+  // result always arrives.
+  const file = fileURLToPath(new URL('./cli.test.js', import.meta.url));
+  const declared = (await fs.readFile(file, 'utf8')).split('\n').filter((line) => line.startsWith('test(')).length;
+  // The runner marks the processes it starts; without clearing the mark the
+  // nested run would think it was one of them and report in their private
+  // format instead of TAP, and this check would compare nothing with nothing.
+  const env = { ...process.env };
+  delete env.NODE_TEST_CONTEXT;
+  const result = spawnSync(process.execPath, ['--test', '--test-reporter=tap', file], { encoding: 'utf8', env });
+  const reported = Number(/# tests (\d+)/.exec(result.stdout)?.[1]);
+  assert.equal(reported, declared, `the runner reported ${reported} of the ${declared} tests declared there`);
 });

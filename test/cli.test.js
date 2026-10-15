@@ -1,11 +1,13 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
 import test, { after } from 'node:test';
+import { fileURLToPath } from 'node:url';
 
-import { OPTION_NAMES, installHandlers, run } from '../src/cli.js';
+import { OPTION_NAMES, installHandlers } from '../src/cli.js';
 
 const cleanups = [];
 after(async () => {
@@ -13,7 +15,7 @@ after(async () => {
 });
 
 /** A minimal PNG: signature, IHDR with the given size, IEND. */
-function pngBuffer(width = 4, height = 3) {
+function pngBuffer(width = 4, height = 3, idatBytes = 0) {
   const signature = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
   const ihdr = Buffer.alloc(13);
   ihdr.writeUInt32BE(width, 0);
@@ -25,7 +27,8 @@ function pngBuffer(width = 4, height = 3) {
     length.writeUInt32BE(data.length, 0);
     return Buffer.concat([length, Buffer.from(type, 'latin1'), data, Buffer.alloc(4)]);
   };
-  return Buffer.concat([signature, chunk('IHDR', ihdr), chunk('IEND', Buffer.alloc(0))]);
+  const idat = idatBytes > 0 ? chunk('IDAT', Buffer.alloc(idatBytes, 0x41)) : Buffer.alloc(0);
+  return Buffer.concat([signature, chunk('IHDR', ihdr), idat, chunk('IEND', Buffer.alloc(0))]);
 }
 
 async function makeFile(name, content) {
@@ -36,21 +39,29 @@ async function makeFile(name, content) {
   return file;
 }
 
-/** Capture output by swapping process.stdout, restored in a finally. */
+/** The bin entry, so the tests drive the command a user actually runs. */
+const BIN = fileURLToPath(new URL('../bin/speck.js', import.meta.url));
+
+/**
+ * Run the CLI in its own process, the way a user does.
+ *
+ * Deliberately not in-process with `process.stdout.write` swapped for a
+ * collector. The test runner reports results over that same stream when it runs
+ * a file in a child process, so replacing the method swallows whole test results
+ * along with the CLI output: ten of the tests here silently vanished from the
+ * report while the suite still said it had passed. `test/cli-kit.test.js` now
+ * runs this file under the runner and compares the count it reports with the
+ * number of tests declared here, which is a check this file cannot make about
+ * itself — if the results never arrive, neither does the complaint.
+ *
+ * Declared async, as it was when it ran the command in-process, so that every
+ * call site reads the same either way.
+ *
+ * @param {string[]} argv
+ */
 async function runCli(argv) {
-  const out = [];
-  const err = [];
-  const originalOut = process.stdout.write.bind(process.stdout);
-  const originalErr = process.stderr.write.bind(process.stderr);
-  process.stdout.write = (chunk) => (out.push(String(chunk)), true);
-  process.stderr.write = (chunk) => (err.push(String(chunk)), true);
-  try {
-    const code = await run(argv);
-    return { code, stdout: out.join(''), stderr: err.join('') };
-  } finally {
-    process.stdout.write = originalOut;
-    process.stderr.write = originalErr;
-  }
+  const result = spawnSync(process.execPath, [BIN, ...argv], { encoding: 'utf8' });
+  return { code: result.status, stdout: result.stdout, stderr: result.stderr };
 }
 
 /**
@@ -123,6 +134,26 @@ test('identify --json is machine readable', async () => {
   assert.ok(report[0].warnings.length > 0);
 });
 
+test('identify reports appended bytes in a PNG larger than the read window', async () => {
+  // The whole point of the tool, on a file of a size people actually have: a
+  // 70 KB image data chunk puts IEND out of reach of the first 64 KB, and the
+  // payload after it used to go unmentioned on every such file.
+  const payload = Buffer.from('hidden payload');
+  const file = await makeFile('big.png', Buffer.concat([pngBuffer(64, 64, 70000), payload]));
+  const result = await runCli(['identify', file]);
+  assert.equal(result.code, 0, result.stderr);
+  assert.match(result.stdout, new RegExp(`${payload.length} bytes follow the IEND chunk of the PNG`));
+});
+
+test('identify does not accuse a file that has no extension', async () => {
+  // Nothing was renamed and nothing is hidden, so there is no finding to report
+  // and 3 would be a false alarm for a script watching the exit code.
+  const file = await makeFile('no-extension', pngBuffer());
+  const result = await runCli(['identify', file]);
+  assert.equal(result.code, 0, `${result.stdout}${result.stderr}`);
+  assert.doesNotMatch(result.stdout, /does not match/);
+});
+
 test('info prints the header fields a person wants', async () => {
   const file = await makeFile('image.png', pngBuffer(640, 480));
   const result = await runCli(['info', file]);
@@ -156,6 +187,27 @@ test('strings prints printable runs and honours --min', async () => {
 
   const long = await runCli(['strings', file, '-n', '40']);
   assert.match(long.stdout, /no printable runs/);
+});
+
+test('strings honours a two-character minimum instead of raising it to four', async () => {
+  // The parser's floor is 2 and the help text says so; the analysis used to
+  // raise 2 and 3 to 4, dropping runs the caller had asked for.
+  const file = await makeFile('runs.bin', Buffer.from('ab\0cd\0a longer run here\0'));
+  const result = await runCli(['strings', file, '--min', '2']);
+  assert.equal(result.code, 0, result.stderr);
+  assert.match(result.stdout, /^ab$/m);
+  assert.match(result.stdout, /^cd$/m);
+});
+
+test('strings refuses a second file rather than quietly ignoring it', async () => {
+  // `speck strings *.bin` used to report the first file and exit 0 as if it had
+  // done them all, which is the worst of both answers.
+  const first = await makeFile('one.bin', Buffer.from('first file contents\0'));
+  const second = await makeFile('two.bin', Buffer.from('second file contents\0'));
+  const result = await runCli(['strings', first, second]);
+  assert.equal(result.code, 2);
+  assert.match(result.stderr, /strings takes one file at a time/);
+  assert.doesNotMatch(result.stdout, /first file contents/);
 });
 
 test('formats lists what this build knows', async () => {
@@ -213,6 +265,15 @@ test('an option whose value never arrived is a usage error', async () => {
   assert.match(result.stderr, /for example --min 8/);
 });
 
+test('a missing value does not swallow the next option as its value', async () => {
+  // `--min --hash` used to read `--hash` as the number: the message blamed the
+  // value instead of the missing one, and --hash vanished from the call.
+  const result = await runCli(['identify', 'small.png', '--min', '--hash']);
+  assert.equal(result.code, 2, result.stderr);
+  assert.match(result.stderr, /--min needs a value/);
+  assert.doesNotMatch(result.stderr, /must be an integer/);
+});
+
 test('an unknown short option says which short option exists', async () => {
   // `-n` is too short for a "did you mean" comparison, so the hint names it.
   const result = await runCli(['strings', 'x', '-m', '8']);
@@ -240,6 +301,17 @@ test('a directory is a failed operation, not a crash', async () => {
   const result = await runCli(['strings', dir]);
   assert.equal(result.code, 1);
   assert.match(result.stderr, /is a directory/);
+});
+
+test('a per-file failure reaches stderr too, so a redirected report keeps it', async () => {
+  // `identify *.bin > report.txt` used to drop the failures on the floor: they
+  // were written to stdout only, and there was nowhere left to see them.
+  const missing = path.join(os.tmpdir(), 'speck-definitely-not-here.bin');
+  const result = await runCli(['identify', missing]);
+  assert.equal(result.code, 1);
+  assert.match(result.stdout, /error/, 'the table on stdout still lists it');
+  assert.match(result.stderr, /error/, 'and stderr has it as well');
+  assert.match(result.stderr, /speck-definitely-not-here\.bin/);
 });
 
 test('the identify code 3 wins over nothing, and an unreadable file still wins over it', async () => {
@@ -302,4 +374,20 @@ test('an executable wearing an image extension is caught', async () => {
   assert.equal(result.code, 3);
   assert.match(result.stdout, /PE executable/);
   assert.match(result.stdout, /does not match/);
+});
+
+test('running src/cli.js directly works from a directory whose name has a hash in it', async () => {
+  // `node src/cli.js` compared import.meta.url against a hand-built file URL,
+  // and import.meta.url escapes `#`, so from such a directory it did nothing at
+  // all and exited 0 — a silent no-op for the whole command.
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'speck-hash#'));
+  cleanups.push(dir);
+  const source = fileURLToPath(new URL('../src/', import.meta.url));
+  await fs.mkdir(path.join(dir, 'src'));
+  for (const entry of await fs.readdir(source)) {
+    await fs.copyFile(path.join(source, entry), path.join(dir, 'src', entry));
+  }
+
+  const result = spawnSync(process.execPath, [path.join(dir, 'src', 'cli.js'), '--version'], { encoding: 'utf8' });
+  assert.match(result.stdout.trim(), /^\d+\.\d+\.\d+$/, `no version printed: ${result.stderr}`);
 });

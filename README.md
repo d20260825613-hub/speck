@@ -58,7 +58,7 @@ Node 18.17 or newer. No dependencies.
 | --- | --- |
 | `speck identify <file...>` | The format, and whether the name agrees. One line per file. |
 | `speck info <file...>` | Everything worth knowing: size, format, dimensions, archive entries, entropy, hash, notable strings. |
-| `speck strings <file>` | Printable ASCII runs, `--min` to set the length. |
+| `speck strings <file>` | Printable ASCII runs, `--min` to set the length. One file at a time: a second file is refused rather than ignored. |
 | `speck formats` | The 40 formats this build recognises. |
 
 `--json` on any of them gives a machine-readable report. `--debug` prints a stack
@@ -80,6 +80,10 @@ run in a script that cares only about misnamed files and can treat `2` as its ow
 bug, while a `1` means the answer is incomplete. An earlier version reported a
 misnamed file as `2`, so a script that read it that way has to be updated.
 
+A file with no extension is not a disagreement. Nothing renamed it and there is
+no name to disagree with, so it is neither reported as misnamed nor counted
+towards code `3`.
+
 ## What it reports
 
 **The format, from the bytes.** 40 formats across executables, archives, images,
@@ -90,9 +94,11 @@ people expect.
 **A name that disagrees with the contents.** Either the file was renamed by
 mistake or by hand, or something is being hidden.
 
-**Data after the end of a container.** A PNG has an `IEND` chunk and a ZIP has a
-central directory; both say where the file should stop. Bytes past that point are
-reported with a count. This is how one file gets hidden inside another.
+**Data after the end of a container.** A PNG has an `IEND` chunk and a ZIP has an
+end-of-central-directory record; both say where the file should stop. Bytes past
+that point are reported with a count, whatever the size of the file: the first
+and last 64 KB are enough to find either marker. An archive comment is part of a
+ZIP rather than data appended to it, so it is not counted against the file.
 
 **Header details worth reading.** PNG and JPEG dimensions, GIF colour tables, WAV
 sample rate and duration, ZIP entry count, ELF class and machine, PE subsystem,
@@ -119,7 +125,10 @@ malicious. It describes the container, not the contents.
 
 It reads the first and last 64 KB. A header that lives beyond that is not seen,
 and a ZIP with a central directory further from the end than that is reported as
-unread rather than guessed at.
+unread rather than guessed at. A PNG is checked in both windows, so appended data
+is found on files of any size; when more than 64 KB has been appended the `IEND`
+chunk is in neither window, and the file says so rather than staying quiet about
+the one thing it could not check.
 
 Identification is by magic bytes, so it recognises the formats in
 `speck formats` and nothing else. A file with no recognisable header is reported
@@ -132,16 +141,21 @@ you were hoping for an exact format.
 npm test
 ```
 
-50 tests across three files: 27 for identification and analysis (`test/speck.test.js`),
-13 that drive the CLI in-process (`test/cli.test.js`) and 10 for the shared error
-and exit-code behaviour (`test/cli-kit.test.js`). The test script names every file
-rather than passing `test/`, because Node 24 rejects a bare directory and Node 18
-and 20 reject a glob, and a file that is named but missing is skipped in silence.
+82 tests across three files: 40 for identification and analysis
+(`test/speck.test.js`), 30 that drive the CLI through `bin/speck.js` in its own
+process (`test/cli.test.js`) and 12 for the shared error and exit-code behaviour
+(`test/cli-kit.test.js`). The test script names every file rather than passing
+`test/`, because Node 24 rejects a bare directory and Node 18 and 20 reject a
+glob, and a file that is named but missing is skipped in silence. For the same
+reason `test/cli-kit.test.js` runs `test/cli.test.js` under the runner and
+compares the number of tests it reports with the number it declares: a test can
+otherwise disappear from the report without turning it red.
 
 The fixtures build real PNG, ZIP and gzip containers byte by byte rather than
 shipping binary files, so the tests show exactly which bytes are being relied on.
 The cases that matter are the disagreements: a PNG named `.jpg`, a payload
-appended after `IEND`, a truncated header, a file with no header at all.
+appended after `IEND` — including in a PNG whose image data is larger than the
+64 KB read window — a truncated header, a file with no header at all.
 
 ## License
 

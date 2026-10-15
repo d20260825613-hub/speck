@@ -95,10 +95,16 @@ function startsWith(buffer, pattern, offset = 0) {
   return true;
 }
 
-/** Does the extension agree with what the bytes say? */
+/**
+ * Does the extension agree with what the bytes say?
+ *
+ * A missing extension is not a disagreement: a file that never had a name says
+ * nothing about its contents, and neither the user nor anything else renamed it.
+ * null means "no opinion", exactly as it does when the bytes match no format.
+ */
 export function extensionAgrees(extension, format) {
   if (!format) return null;
-  if (!extension) return false;
+  if (!extension) return null;
   const lower = extension.toLowerCase();
   return format.extensions.some((candidate) => candidate === lower || lower.endsWith(candidate));
 }

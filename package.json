@@ -1,6 +1,6 @@
 {
   "name": "speck",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Identify a file from its bytes, not its extension, and report what is hidden: appended data, embedded scripts, mismatched names, high entropy.",
   "license": "MIT",
   "type": "module",

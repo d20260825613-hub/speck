@@ -111,13 +111,26 @@ export async function analyzeFile(file, options = {}) {
   const handle = await fs.open(absolute, 'r');
   let head;
   let tail;
+  let tailStart = 0;
   try {
     const length = Math.min(headBytes, stat.size);
     head = Buffer.alloc(length);
-    if (length > 0) await handle.read(head, 0, length, 0);
+    // A read may return fewer bytes than it was asked for — the file can shrink
+    // between the stat above and the read below, and a network share or a
+    // special file need not fill the request. The rest of the buffer is then the
+    // zeroes it was allocated with, and analysing those as if they were the
+    // file's own bytes would be a silent lie. Keep only what arrived.
+    if (length > 0) {
+      const { bytesRead } = await handle.read(head, 0, length, 0);
+      if (bytesRead < length) head = head.subarray(0, bytesRead);
+    }
     const tailLength = Math.min(headBytes, stat.size);
+    tailStart = Math.max(0, stat.size - tailLength);
     tail = Buffer.alloc(tailLength);
-    if (tailLength > 0) await handle.read(tail, 0, tailLength, Math.max(0, stat.size - tailLength));
+    if (tailLength > 0) {
+      const { bytesRead } = await handle.read(tail, 0, tailLength, tailStart);
+      if (bytesRead < tailLength) tail = tail.subarray(0, bytesRead);
+    }
   } finally {
     await handle.close();
   }
@@ -146,24 +159,34 @@ export async function analyzeFile(file, options = {}) {
   // Data appended after a container's declared end is the classic way to hide
   // one file inside another.
   if (format?.id === 'zip') {
-    const endSignature = Buffer.from([0x50, 0x4b, 0x05, 0x06]);
-    const at = tail.lastIndexOf(endSignature);
-    if (at >= 0) {
-      const declaredEnd = stat.size - tail.length + at + 22;
-      const trailing = stat.size - declaredEnd;
-      if (trailing > 0) {
-        warnings.push(`${trailing} bytes follow the end of the ZIP archive; something has been appended to it`);
-      }
+    const declaredEnd = zipEndOffset(tail, tailStart, stat.size);
+    if (declaredEnd !== null && stat.size > declaredEnd) {
+      warnings.push(`${stat.size - declaredEnd} bytes follow the end of the ZIP archive; something has been appended to it`);
     }
   }
   if (format?.id === 'png') {
-    const end = pngEndOffset(head, tail, stat.size);
+    const { end, outOfWindow } = pngEndOffset(head, tail, tailStart, stat.size);
     if (end !== null && stat.size > end) {
       warnings.push(`${stat.size - end} bytes follow the IEND chunk of the PNG`);
+    } else if (outOfWindow) {
+      // Saying nothing here is the failure this tool exists to avoid: the image
+      // may well stop well before the end of the file and we cannot see where.
+      warnings.push('the IEND chunk is not in the first or last 64 KB, so anything appended after it cannot be counted');
     }
   }
 
-  const details = format ? readDetails(head, format) : null;
+  // The ZIP reader needs the end of the file, every other reader the start.
+  // A reader that throws is a defect in the reader, and reporting it as a file
+  // that "could not be read" would blame the wrong thing: the bytes are here,
+  // they were only unexpected.
+  let details = null;
+  if (format) {
+    try {
+      details = readDetails(format.id === 'zip' ? tail : head, format);
+    } catch (error) {
+      warnings.push(`the ${format.name} header could not be read: ${error.message}`);
+    }
+  }
   if (details) warnings.push(...details.warnings);
 
   const bom = detectBom(head);
@@ -183,7 +206,10 @@ export async function analyzeFile(file, options = {}) {
 
   const notable = [];
   if (strings > 0) {
-    for (const candidate of extractStrings(head, Math.max(4, strings), 200)) {
+    // The minimum asked for, not a floor of this function's own: the parser
+    // accepts anything from 2 up, and quietly raising 2 to 4 rewrites the
+    // caller's request.
+    for (const candidate of extractStrings(head, strings, 200)) {
       for (const rule of NOTABLE_STRINGS) {
         if (rule.pattern.test(candidate)) {
           notable.push({ value: candidate.slice(0, 120), why: rule.why });
@@ -211,12 +237,18 @@ export async function analyzeFile(file, options = {}) {
     entropy: fileEntropy,
     sha256: digest,
     details: details ? details.fields : [],
-    strings: strings > 0 ? extractStrings(head, Math.max(4, strings)) : [],
+    strings: strings > 0 ? extractStrings(head, strings) : [],
     notable,
     warnings,
     notes,
   };
 }
+
+/** IEND is always empty, so its chunk header is always this exact run of bytes. */
+const IEND_CHUNK_HEADER = Buffer.from([0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44]);
+
+/** The end-of-central-directory record: where a ZIP says its contents stop. */
+const ZIP_END_SIGNATURE = Buffer.from([0x50, 0x4b, 0x05, 0x06]);
 
 /**
  * Where a PNG's data ends, according to the chunk list.
@@ -226,29 +258,81 @@ export async function analyzeFile(file, options = {}) {
  * fixtures, emit a wrong or zero CRC. Walking also rejects a stray "IEND" that
  * happens to appear inside compressed image data.
  *
- * Returns the byte offset just past the IEND chunk, or null when the walk could
- * not reach it within the bytes available.
+ * Only the first and last 64 KB are in memory. Each chunk header is read from
+ * whichever of the two holds it, which is what makes a chunk that spans the
+ * boundary harmless: the walk follows the declared lengths instead of assuming
+ * the two windows are adjacent in memory. `tailStart` is the file offset the
+ * tail begins at, so a header in the tail can be translated back.
+ *
+ * @returns {{end: number|null, outOfWindow: boolean}} `end` is the byte offset
+ * just past the IEND chunk, or null when the walk could not reach it.
+ * `outOfWindow` says the walk stopped because the bytes it needed next are
+ * neither in the head nor in the tail, which is not the same as a damaged file.
  */
-function pngEndOffset(head, tail, totalSize) {
-  const buffer = Buffer.concat([head, tail]);
-  // The head starts at 0; the tail starts at totalSize - tail.length.
-  const tailStart = totalSize - tail.length;
+function pngEndOffset(head, tail, tailStart, totalSize) {
+  const headerAt = (offset) => {
+    if (offset + 12 <= head.length) return head.subarray(offset, offset + 12);
+    const index = offset - tailStart;
+    if (index >= 0 && index + 12 <= tail.length) return tail.subarray(index, index + 12);
+    return null;
+  };
+
   let offset = 8; // past the signature
-  while (offset + 12 <= buffer.length) {
-    const absolute = offset;
-    const length = buffer.readUInt32BE(offset);
-    const type = buffer.toString('latin1', offset + 4, offset + 8);
-    if (!/^[A-Za-z]{4}$/.test(type)) return null; // not a chunk header; give up
-    const chunkEnd = offset + 12 + length;
-    if (type === 'IEND') {
-      // Only meaningful when the offset is inside the head, or the tail covers it.
-      const absoluteEnd = (absolute < head.length ? absolute : tailStart + (absolute - head.length)) + 12 + length;
-      return absoluteEnd;
+  let stalled = false;
+  while (offset + 12 <= totalSize) {
+    const header = headerAt(offset);
+    if (header === null) {
+      stalled = true;
+      break;
     }
-    if (chunkEnd > buffer.length) return null;
+    const length = header.readUInt32BE(0);
+    const type = header.toString('latin1', 4, 8);
+    if (!/^[A-Za-z]{4}$/.test(type)) return { end: null, outOfWindow: false }; // not a chunk header; give up
+    if (type === 'IEND') return { end: offset + 12 + length, outOfWindow: false };
+    const chunkEnd = offset + 12 + length;
+    if (chunkEnd + 12 > totalSize) return { end: null, outOfWindow: false }; // no room left for one
     offset = chunkEnd;
   }
-  return null;
+
+  // The head covers the whole file, so the walk above had every byte there is:
+  // an IEND it did not find is a damaged file, not a missing window.
+  if (!stalled || head.length >= totalSize) return { end: null, outOfWindow: false };
+
+  // A chunk header landed in the gap between the two windows, which is the
+  // normal case for a PNG with enough chunks to cross 64 KB. IEND is the last
+  // chunk of a PNG, so it is in the tail whatever the gap holds: look for the
+  // empty chunk's exact header. Eight bytes spelling "no length, IEND" are not
+  // something compressed image data produces by accident.
+  const at = tail.lastIndexOf(IEND_CHUNK_HEADER);
+  if (at >= 0) return { end: tailStart + at + 12, outOfWindow: false };
+  return { end: null, outOfWindow: true };
+}
+
+/**
+ * Where a ZIP's declared contents end: just past the end-of-central-directory
+ * record, plus the archive comment the format allows after it.
+ *
+ * The comment is a legal part of the file, so it does not count as appended
+ * data — mistaking it for that accuses an honest archive of hiding something.
+ * The signature is searched for from the end because an occurrence inside a
+ * comment is a false one, and an archive comment is free to contain those four
+ * bytes. Of the records that fit inside the file, the one that accounts for
+ * every byte is the real end; failing that, the last one is the best answer
+ * there is.
+ *
+ * @returns {number|null} the declared end offset, or null when no record that
+ * fits is within the bytes read.
+ */
+function zipEndOffset(tail, tailStart, totalSize) {
+  let best = null;
+  for (let at = tail.lastIndexOf(ZIP_END_SIGNATURE); at >= 0; at = tail.lastIndexOf(ZIP_END_SIGNATURE, at - 1)) {
+    if (at + 22 > tail.length) continue; // too close to the end to hold a record
+    const end = tailStart + at + 22 + tail.readUInt16LE(at + 20);
+    if (end > totalSize) continue; // the record claims to end past the file
+    if (end === totalSize) return end;
+    best ??= end;
+  }
+  return best;
 }
 
 /** Analyse several files, keeping going when one of them fails. */

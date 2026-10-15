@@ -35,6 +35,53 @@ function pngBuffer(width = 3, height = 2) {
   return Buffer.concat([signature, ihdr, iend]);
 }
 
+/**
+ * A real PNG whose compressed image data is larger than the 64 KB read window.
+ *
+ * The size is the point: only a file this big puts IEND beyond everything the
+ * analysis holds in memory, which is where the chunk walk used to lose the end
+ * of the image and report nothing at all. The pixels come from a fixed
+ * generator and are deflated the way an encoder deflates them, so this is a
+ * legal PNG that any decoder would accept rather than a container with an
+ * oversized chunk header.
+ *
+ * @param {number} [side] image is side x side, 8-bit RGBA
+ * @param {number} [idatChunks] how many IDAT chunks to split the stream into
+ */
+function largePngBuffer(side = 200, idatChunks = 1) {
+  const signature = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  const ihdrData = Buffer.alloc(13);
+  ihdrData.writeUInt32BE(side, 0);
+  ihdrData.writeUInt32BE(side, 4);
+  ihdrData.writeUInt8(8, 8);
+  ihdrData.writeUInt8(6, 9);
+
+  // Raw scanlines: a filter byte per row (0, "none"), then four bytes a pixel.
+  const stride = 1 + side * 4;
+  const raw = Buffer.alloc(stride * side);
+  let state = 0x9e3779b9;
+  for (let y = 0; y < side; y += 1) {
+    for (let x = 1; x < stride; x += 1) {
+      // A fixed xorshift32 stream: random-looking enough that deflate cannot
+      // squeeze it, and identical on every run, so the fixture is reproducible.
+      state ^= state << 13;
+      state >>>= 0;
+      state ^= state >>> 17;
+      state ^= state << 5;
+      state >>>= 0;
+      raw[y * stride + x] = state & 0xff;
+    }
+  }
+
+  const stream = zlib.deflateSync(raw);
+  const perChunk = Math.ceil(stream.length / idatChunks);
+  const idat = [];
+  for (let at = 0; at < stream.length; at += perChunk) {
+    idat.push(chunk('IDAT', stream.subarray(at, at + perChunk)));
+  }
+  return Buffer.concat([signature, chunk('IHDR', ihdrData), ...idat, chunk('IEND', Buffer.alloc(0))]);
+}
+
 function chunk(type, data) {
   const length = Buffer.alloc(4);
   length.writeUInt32BE(data.length, 0);
@@ -54,10 +101,13 @@ function crc32(buffer) {
   return (crc ^ 0xffffffff) >>> 0;
 }
 
-/** A minimal ZIP with one stored entry and a correct central directory. */
-function zipBuffer(name = 'hello.txt', content = 'hi') {
+/** A minimal ZIP with one stored entry, a correct central directory, and an
+ * optional archive comment — which the format allows and which is part of the
+ * file rather than something appended to it. */
+function zipBuffer(name = 'hello.txt', content = 'hi', comment = null) {
   const nameBytes = Buffer.from(name, 'latin1');
   const data = Buffer.from(content, 'latin1');
+  const commentBytes = comment === null ? Buffer.alloc(0) : Buffer.from(comment, 'latin1');
   const crc = crc32(data);
 
   const local = Buffer.alloc(30);
@@ -88,8 +138,9 @@ function zipBuffer(name = 'hello.txt', content = 'hi') {
   end.writeUInt16LE(1, 10);
   end.writeUInt32LE(centralPart.length, 12);
   end.writeUInt32LE(localPart.length, 16);
+  end.writeUInt16LE(commentBytes.length, 20);
 
-  return Buffer.concat([localPart, centralPart, end]);
+  return Buffer.concat([localPart, centralPart, end, commentBytes]);
 }
 
 // --- identification -------------------------------------------------------
@@ -146,7 +197,11 @@ test('extensionAgrees compares against the format, not a fixed list', () => {
   assert.equal(extensionAgrees('.png', png), true);
   assert.equal(extensionAgrees('.PNG', png), true, 'case does not matter');
   assert.equal(extensionAgrees('.jpg', png), false);
-  assert.equal(extensionAgrees(null, png), false);
+  // A file with no extension is not a file whose extension disagrees: nothing
+  // renamed it, so there is nothing to report. null is "no opinion", the same
+  // answer as when the bytes match no known format.
+  assert.equal(extensionAgrees(null, png), null);
+  assert.equal(extensionAgrees('', png), null);
   assert.equal(extensionAgrees('.png', null), null, 'no format means no opinion');
 });
 
@@ -221,6 +276,68 @@ test('bytes appended to a PNG are reported', async () => {
   assert.ok(result.warnings.some((w) => /follow the IEND chunk/.test(w)), JSON.stringify(result.warnings));
 });
 
+test('a PNG with no extension is described, not accused of a mismatched name', async () => {
+  // The extension slot is empty. Nothing was renamed and nothing is hidden, so
+  // neither the warning nor the exit code it drives applies.
+  const file = await makeFile('no-extension', pngBuffer());
+  const result = await analyzeFile(file);
+  assert.equal(result.format.id, 'png');
+  assert.equal(result.extension, null);
+  assert.deepEqual(result.warnings, [], JSON.stringify(result.warnings));
+});
+
+test('bytes appended to a PNG larger than the read window are still reported', async () => {
+  // A real 200 x 200 PNG is a little over 140 KB, so IEND sits past the first
+  // 64 KB, where a chunk used to end up half inside the window and half outside
+  // it. The walk gave up there and the appended payload was never mentioned —
+  // the tool's headline feature quietly doing nothing on any PNG of a realistic
+  // size.
+  const payload = Buffer.from('HIDDEN PAYLOAD after the image!');
+  const file = await makeFile('big-tail.png', Buffer.concat([largePngBuffer(200), payload]));
+  const result = await analyzeFile(file);
+  assert.equal(result.format.id, 'png');
+  assert.ok(result.bytes > 64 * 1024, `the fixture has to cross the boundary, got ${result.bytes}`);
+  assert.ok(
+    result.warnings.some((w) => new RegExp(`^${payload.length} bytes follow the IEND chunk`).test(w)),
+    JSON.stringify(result.warnings),
+  );
+});
+
+test('the large PNG fixture is a real PNG and not just the right shape', async () => {
+  // Its IDAT stream inflates back to the raw scanlines that were deflated into
+  // it, which is what makes the size-boundary tests above evidence about real
+  // files rather than about a container built to look like one.
+  const buffer = largePngBuffer(200);
+  let offset = 8;
+  const idat = [];
+  while (offset + 12 <= buffer.length) {
+    const length = buffer.readUInt32BE(offset);
+    const type = buffer.toString('latin1', offset + 4, offset + 8);
+    if (type === 'IDAT') idat.push(buffer.subarray(offset + 8, offset + 8 + length));
+    offset += 12 + length;
+  }
+  const compressed = Buffer.concat(idat);
+  assert.ok(compressed.length > 64 * 1024, `the image data is only ${compressed.length} bytes`);
+  assert.equal(zlib.inflateSync(compressed).length, 200 * (1 + 200 * 4));
+});
+
+test('a large PNG split into many chunks is walked all the way to IEND', async () => {
+  // The shape real encoders produce: many IDAT chunks, so the walk has to cross
+  // the gap between the two read windows rather than jump over one big chunk.
+  const file = await makeFile('many-chunks.png', largePngBuffer(200, 20));
+  const result = await analyzeFile(file);
+  assert.ok(result.bytes > 64 * 1024, `the fixture has to cross the boundary, got ${result.bytes}`);
+  assert.deepEqual(result.warnings, [], JSON.stringify(result.warnings));
+});
+
+test('a PNG whose IEND is beyond the read window says so instead of staying quiet', async () => {
+  // Nothing can be counted here, and saying nothing would be the same silence
+  // the size boundary caused in the first place.
+  const file = await makeFile('huge-tail.png', Buffer.concat([largePngBuffer(200), Buffer.alloc(70000, 0x5a)]));
+  const result = await analyzeFile(file);
+  assert.ok(result.warnings.some((w) => /IEND chunk is not in the first or last 64 KB/.test(w)), JSON.stringify(result.warnings));
+});
+
 test('a ZIP lists its entry count', async () => {
   const file = await makeFile('archive.zip', zipBuffer());
   const result = await analyzeFile(file);
@@ -233,6 +350,47 @@ test('bytes appended to a ZIP are reported', async () => {
   const file = await makeFile('tail.zip', Buffer.concat([zipBuffer(), Buffer.from('appended')]));
   const result = await analyzeFile(file);
   assert.ok(result.warnings.some((w) => /follow the end of the ZIP/.test(w)), JSON.stringify(result.warnings));
+});
+
+test('a ZIP comment is part of the archive, not data appended to it', async () => {
+  // The record says how long the comment is; the bytes past the comment are the
+  // ones that are not part of the file. Accusing a legal comment is a false
+  // positive on the exact judgement this tool exists to make.
+  const file = await makeFile('commented.zip', zipBuffer('hello.txt', 'hi', 'a legal archive comment'));
+  const result = await analyzeFile(file);
+  assert.equal(result.format.id, 'zip');
+  assert.deepEqual(result.warnings, [], JSON.stringify(result.warnings));
+});
+
+test('bytes appended after a ZIP comment are still reported', async () => {
+  const file = await makeFile('commented-tail.zip', Buffer.concat([zipBuffer('hello.txt', 'hi', 'legal comment'), Buffer.from('appended')]));
+  const result = await analyzeFile(file);
+  assert.ok(result.warnings.some((w) => /^8 bytes follow the end of the ZIP archive/.test(w)), JSON.stringify(result.warnings));
+});
+
+test('a comment containing the end signature does not move the end of the archive', async () => {
+  // An archive comment may hold any bytes, including the four that begin the
+  // end-of-central-directory record. Only the record that accounts for the
+  // whole file is the real end, so this one is still not accused of anything.
+  const comment = `PK\x05\x06${'\0'.repeat(20)}`;
+  const file = await makeFile('tricky-comment.zip', zipBuffer('hello.txt', 'hi', comment));
+  const result = await analyzeFile(file);
+  assert.deepEqual(result.warnings, [], JSON.stringify(result.warnings));
+});
+
+test('a ZIP larger than the read window still lists its entry count', async () => {
+  // The end record is at the end of the file, so reading only the head left the
+  // reader to report a central directory it had not actually looked for.
+  const file = await makeFile('big.zip', zipBuffer('big.bin', Buffer.alloc(70000, 0x41)));
+  const result = await analyzeFile(file);
+  assert.equal(result.format.id, 'zip');
+  assert.ok(result.bytes > 64 * 1024, `the fixture has to cross the boundary, got ${result.bytes}`);
+  assert.ok(result.details.some((f) => f.label === 'entries' && f.value === '1'), JSON.stringify(result.details));
+  assert.equal(
+    result.warnings.some((w) => /central directory is not in the bytes read/.test(w)),
+    false,
+    JSON.stringify(result.warnings),
+  );
 });
 
 test('a gzip stream reports the original name it carries', async () => {
@@ -304,4 +462,65 @@ test('a truncated PNG reports the damage instead of throwing', async () => {
   const result = await analyzeFile(file);
   assert.equal(result.format.id, 'png');
   assert.ok(result.warnings.length > 0, 'a truncated header should be reported');
+});
+
+test('an ELF of any short length is described instead of crashing the analysis', async () => {
+  // 20 to 39 bytes is the trap: the 64-bit program header offset is eight bytes
+  // at offset 32, so it needs 40 bytes where the 32-bit one needs 32. Reading it
+  // with the raw buffer method threw a RangeError that the caller turned into
+  // "this file could not be read" — for a file that was sitting right there.
+  for (let size = 4; size <= 70; size += 1) {
+    const header = Buffer.alloc(size);
+    header.writeUInt32BE(0x7f454c46, 0);
+    header[4] = 2; // 64-bit class, the case that used to throw
+    header[5] = 1; // little-endian
+    const file = await makeFile(`tiny-${size}.elf`, header);
+    const result = await analyzeFile(file);
+    assert.equal(result.format?.id, 'elf', `${size} bytes was not identified as ELF`);
+    if (size >= 20 && size < 40) {
+      assert.ok(
+        result.warnings.some((w) => /program header offset is outside/.test(w)),
+        `${size} bytes: ${JSON.stringify(result.warnings)}`,
+      );
+    }
+  }
+});
+
+test('a JPEG cut off inside the frame header says so instead of half-reporting it', async () => {
+  // FFD8, then an APP0 segment of the declared length, then FFC0 with only one
+  // byte of its payload: enough for the marker, nowhere near enough for the
+  // precision, height, width and component count it promises.
+  const truncated = Buffer.concat([
+    Buffer.from([0xff, 0xd8]),
+    Buffer.from([0xff, 0xe0, 0x00, 0x10]),
+    Buffer.alloc(14, 0),
+    Buffer.from([0xff, 0xc0, 0x00, 0x11, 0x08]),
+  ]);
+  const file = await makeFile('cut.jpg', truncated);
+  const result = await analyzeFile(file);
+  assert.equal(result.format.id, 'jpeg');
+  assert.ok(result.warnings.some((w) => /frame header is cut off/.test(w)), JSON.stringify(result.warnings));
+  assert.equal(result.details.some((f) => f.label === 'precision'), false, 'no field may be invented');
+});
+
+test('a PE cut off before its optional header says which field is missing', async () => {
+  const buffer = Buffer.alloc(100);
+  buffer.write('MZ', 0, 'latin1');
+  buffer.writeUInt32LE(0x40, 0x3c);
+  buffer.write('PE\0\0', 0x40, 'latin1');
+  buffer.writeUInt16LE(0x8664, 0x44);
+  buffer.writeUInt16LE(3, 0x46);
+  const file = await makeFile('short.exe', buffer);
+  const result = await analyzeFile(file);
+  assert.equal(result.format.id, 'pe');
+  assert.ok(result.warnings.some((w) => /optional header is cut off/.test(w)), JSON.stringify(result.warnings));
+  assert.equal(result.details.some((f) => f.label === 'subsystem'), false);
+});
+
+test('a two-character minimum for strings is honoured rather than raised to four', async () => {
+  // The parser accepts 2, the documentation says 2 is the floor, and the
+  // analysis used to raise 2 and 3 to 4 on the quiet.
+  const file = await makeFile('runs.bin', Buffer.from('ab\0cd\0a longer run here\0'));
+  const result = await analyzeFile(file, { strings: 2 });
+  assert.deepEqual(result.strings, ['ab', 'cd', 'a longer run here']);
 });

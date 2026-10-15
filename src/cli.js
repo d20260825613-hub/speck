@@ -13,12 +13,13 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import process from 'node:process';
+import { pathToFileURL } from 'node:url';
 
 import { UsageError, formatError, installCliHandlers, unknownOptionError } from './cli-kit.js';
 import { analyzeFile, analyzeMany } from './analyze.js';
 import { FORMATS } from './magic.js';
 
-const VERSION = '0.1.0';
+const VERSION = '0.2.0';
 
 const USAGE = `speck - what is actually inside this file?
 
@@ -111,6 +112,16 @@ function missingValueError(name) {
 }
 
 /**
+ * Is this token another option rather than the value of the one before it?
+ *
+ * `-` is a file name by convention, and a leading minus followed by a digit is a
+ * negative number, so neither of those is an option.
+ */
+function looksLikeOption(token) {
+  return token.startsWith('-') && token !== '-' && !/^-?\d/.test(token);
+}
+
+/**
  * An unknown option, with the closest real one attached.
  *
  * `unknownOptionError` strips the leading dashes itself, so the token goes in
@@ -145,8 +156,14 @@ function parseArgs(argv) {
         missing ??= name;
         return undefined;
       }
-      const next = argv[++i];
-      if (next !== undefined) return next;
+      // The next token is the value only when it is not another option. Taking
+      // `--hash` as the value of `--min` would swallow it and then complain that
+      // the number it is not is not a number, pointing at the wrong problem.
+      const next = argv[i + 1];
+      if (next !== undefined && !looksLikeOption(next)) {
+        i += 1;
+        return next;
+      }
       missing ??= name;
       return undefined;
     };
@@ -214,6 +231,19 @@ function kindColour(kind) {
   return (t) => paint(t, 34);
 }
 
+/**
+ * Should a per-file error be copied to stderr as well as listed on stdout?
+ *
+ * The error belongs with the table on stdout, where a person reading the report
+ * sees which file failed. But `identify *.bin > report.txt` would then lose it
+ * entirely, so it is copied to stderr whenever stdout is not a terminal. With
+ * `--json` it always is: the caller is parsing stdout, and a human sentence
+ * mixed into the JSON would break that parse.
+ */
+function errorsAlsoOnStderr(json) {
+  return Boolean(json) || !process.stdout.isTTY;
+}
+
 async function commandIdentify(argv) {
   const parsed = parseArgs(argv);
   if (parsed.error) return failFrom(parsed.error);
@@ -222,13 +252,21 @@ async function commandIdentify(argv) {
     throw new UsageError('identify needs at least one file', { hint: 'for example speck identify photo.png' });
   }
 
+  const copyErrors = errorsAlsoOnStderr(values.json);
+  const errorLine = (result) => `${red('error')}   ${result.name ?? result.path}: ${result.error}\n`;
   const results = await analyzeMany(files, { hash: values.hash });
   if (values.json) {
     process.stdout.write(`${JSON.stringify(results, null, 2)}\n`);
+    if (copyErrors) {
+      for (const result of results) {
+        if (result.error) process.stderr.write(errorLine(result));
+      }
+    }
   } else {
     for (const result of results) {
       if (result.error) {
-        process.stdout.write(`${red('error')}   ${result.name ?? result.path}: ${result.error}\n`);
+        process.stdout.write(errorLine(result));
+        if (copyErrors) process.stderr.write(errorLine(result));
         continue;
       }
       const colour = result.format ? kindColour(result.format.kind) : dim;
@@ -274,14 +312,23 @@ async function commandInfo(argv) {
     }
   }
 
+  const copyErrors = errorsAlsoOnStderr(values.json);
+  const errorLine = (result) => `${red('error')} ${result.path}: ${result.error}\n`;
+
   if (values.json) {
     process.stdout.write(`${JSON.stringify(results.length === 1 ? results[0] : results, null, 2)}\n`);
+    if (copyErrors) {
+      for (const result of results) {
+        if (result.error) process.stderr.write(errorLine(result));
+      }
+    }
     return results.some((r) => r.error) ? 1 : 0;
   }
 
   for (const result of results) {
     if (result.error) {
-      process.stdout.write(`${red('error')} ${result.path}: ${result.error}\n\n`);
+      process.stdout.write(`${errorLine(result)}\n`);
+      if (copyErrors) process.stderr.write(errorLine(result));
       continue;
     }
     process.stdout.write(`${bold(result.name)}\n`);
@@ -326,6 +373,12 @@ async function commandStrings(argv) {
   const parsed = parseArgs(argv);
   if (parsed.error) return failFrom(parsed.error);
   const { values, files } = parsed;
+  // Taking the first and dropping the rest would make `speck strings *.bin`
+  // report one file's strings and exit 0 as if it had done the lot, so a second
+  // file is refused rather than ignored.
+  if (files.length > 1) {
+    throw new UsageError('strings takes one file at a time', { hint: 'for example speck strings suspicious.pdf' });
+  }
   const file = files[0];
   if (!file) throw new UsageError('strings needs a file', { hint: 'for example speck strings suspicious.pdf' });
 
@@ -429,7 +482,10 @@ export function installHandlers() {
 }
 
 // Only run when invoked directly, so importing this module in a test is safe.
-if (process.argv[1] && import.meta.url === new URL(`file://${process.argv[1].replace(/\\/g, '/')}`).href) {
+// The path is turned into a URL by the standard helper rather than by pasting
+// `file://` onto it: import.meta.url escapes `#`, `%` and `?`, and a hand-built
+// string does not, so a checkout under such a directory silently did nothing.
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   // Installed before anything else runs, for `node src/cli.js ...`.
   installHandlers();
   run(process.argv.slice(2)).then(

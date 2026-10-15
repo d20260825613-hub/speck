@@ -107,6 +107,14 @@ function jpeg(buffer) {
     if (length === null) break;
     const isStartOfFrame = marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc;
     if (isStartOfFrame) {
+      // Marker, length, precision, height, width and component count: ten bytes.
+      // A file that stops inside the frame header has no dimensions to give, and
+      // printing the fields that did arrive would make a truncated download look
+      // like a complete one.
+      if (offset + 10 > buffer.length) {
+        warnings.push('the frame header is cut off at the end of the bytes read');
+        break;
+      }
       const precision = buffer[offset + 4];
       const height = u16be(buffer, offset + 5);
       const width = u16be(buffer, offset + 7);
@@ -244,8 +252,15 @@ function elf(buffer) {
 
   // The program header offset tells us where the entry point lives, and for a
   // position-independent executable it is also where the interpreter is named.
-  const phoff = is64 ? Number(buffer.readBigUInt64LE(32)) : u32le(buffer, 28);
-  if (phoff) fields.push({ label: 'program headers at', value: `${phoff}` });
+  // The 64-bit field is eight bytes wide, so it needs 40 bytes where the 32-bit
+  // one needs 32: going through the bounds-checked reader is what keeps a file
+  // that stops in the middle of the header a partial report instead of a crash.
+  const phoff = is64 ? u64le(buffer, 32) : u32le(buffer, 28);
+  if (phoff === null) {
+    warnings.push('the program header offset is outside the bytes read');
+  } else if (phoff) {
+    fields.push({ label: 'program headers at', value: `${phoff}` });
+  }
   return { format: 'elf', fields, warnings };
 }
 
@@ -271,8 +286,13 @@ function pe(buffer) {
   const sections = u16le(buffer, peOffset + 6);
   const characteristics = u16le(buffer, peOffset + 22);
   const optionalMagic = u16le(buffer, peOffset + 24);
-  const subsystem = u16le(buffer, peOffset + 24 + 68);
+  // The subsystem sits 68 bytes into the optional header, which a file cut short
+  // may never reach. Saying so is the difference between "there is no subsystem"
+  // and "the bytes to read it are not here".
+  const hasSubsystem = peOffset + 94 <= buffer.length;
+  const subsystem = hasSubsystem ? u16le(buffer, peOffset + 24 + 68) : null;
   fields.push({ label: 'PE header at', value: `${peOffset}` });
+  if (!hasSubsystem) warnings.push('the optional header is cut off at the end of the bytes read');
   if (machine) fields.push({ label: 'machine', value: machines[machine] ?? `unknown (0x${machine.toString(16)})` });
   if (sections !== null) fields.push({ label: 'sections', value: `${sections}` });
   if (optionalMagic === 0x10b) fields.push({ label: 'optional header', value: 'PE32 (32-bit)' });
